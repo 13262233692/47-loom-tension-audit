@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"time"
@@ -21,9 +22,15 @@ func main() {
 	defer f.Close()
 
 	spindleCount := 20
-	pointsPerSpindle := 500
+	pointsPerSpindle := 1024
+	sampleRate := 10.0
+	motorFreq := 2.0
+	motorAmplitude := 3.5
 	anomalySpindles := []int{3, 7, 15}
-	anomalyPositions := []int{250, 300, 400}
+	anomalyPositions := []int{500, 600, 800}
+	bearingWearSpindles := []int{1, 6, 12}
+	bearingWearFreqs := []float64{3.5, 4.2, 0.8}
+	bearingWearAmplitudes := []float64{8.0, 7.5, 7.0}
 
 	fmt.Fprintln(f, "timestamp,spindle_id,tension_cN")
 
@@ -47,13 +54,36 @@ func main() {
 			}
 		}
 
+		isBearingWear := false
+		bearingFreq := 0.0
+		bearingAmp := 0.0
+		for i, bs := range bearingWearSpindles {
+			if s == bs {
+				isBearingWear = true
+				bearingFreq = bearingWearFreqs[i]
+				bearingAmp = bearingWearAmplitudes[i]
+				break
+			}
+		}
+
 		t := baseTime
 		for p := 0; p < pointsPerSpindle; p++ {
 			tension := baseTension + rng.NormFloat64()*noise
 
+			motorPhase := 2.0 * math.Pi * motorFreq * float64(p) / sampleRate
+			tension += motorAmplitude * math.Sin(motorPhase)
+
 			if isAnomalySpindle && p == anomalyPos {
 				drop := baseTension * 0.35
 				tension = baseTension - drop + rng.NormFloat64()*0.5
+			}
+
+			if isBearingWear {
+				phase := 2.0 * math.Pi * bearingFreq * float64(p) / sampleRate
+				envelope := 1.0
+				progress := float64(p) / float64(pointsPerSpindle)
+				envelope = 0.3 + 0.7*progress
+				tension += bearingAmp * envelope * math.Sin(phase)
 			}
 
 			if tension < 0 {
@@ -123,6 +153,11 @@ func main() {
 	totalNormal := spindleCount*pointsPerSpindle - malformedLines
 	fmt.Fprintf(os.Stderr, "生成完成: %d 正常行 + %d 畸形行 = %d 行\n",
 		totalNormal, malformedLines, totalNormal+malformedLines)
-	fmt.Fprintf(os.Stderr, "异常锭子: SP-004, SP-008, SP-016\n")
-	fmt.Fprintf(os.Stderr, "畸形行类型: 空张力值 / 空锭子号 / 空时间戳 / NAN / 负数 / Inf / 纯噪声 / 缺字段 / 空行 / 含零字节\n")
+	fmt.Fprintf(os.Stderr, "张力突降锭子: SP-004, SP-008, SP-016\n")
+	fmt.Fprintf(os.Stderr, "轴承磨损锭子:\n")
+	for i, bs := range bearingWearSpindles {
+		fmt.Fprintf(os.Stderr, "  SP-%03d: 磨损共振频率 %.1f Hz (标准 2.0 Hz), 幅值 %.1f cN, 逐渐增强\n",
+			bs+1, bearingWearFreqs[i], bearingWearAmplitudes[i])
+	}
+	fmt.Fprintf(os.Stderr, "采样率: %.1f Hz | 电机标准频率: %.1f Hz | 电机信号幅值: %.1f cN | 漂移阈值: 0.5 Hz\n", sampleRate, motorFreq, motorAmplitude)
 }
