@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,14 +18,16 @@ import (
 )
 
 var (
-	argWindow    int
-	argZScore    float64
-	argWorkers   int
-	argSkipHead  bool
-	argFile      string
-	totalLines   int64
-	anomalyCount int64
-	outputMu     sync.Mutex
+	argWindow     int
+	argZScore     float64
+	argWorkers    int
+	argSkipHead   bool
+	argFile       string
+	totalLines    int64
+	anomalyCount  int64
+	malformedCnt  int64
+	panicCount    int64
+	outputMu      sync.Mutex
 )
 
 func init() {
@@ -55,7 +58,12 @@ func NewSlidingWindow(size int) *SlidingWindow {
 	}
 }
 
-func (w *SlidingWindow) CheckAndPush(value float64) (mean, stddev, zscore float64, anomaly bool) {
+func (w *SlidingWindow) CheckAndPush(value float64) (mean, stddev, zscore float64, anomaly bool, rejected bool) {
+	if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+		rejected = true
+		return
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -124,6 +132,12 @@ type SensorRecord struct {
 	LineNo    int64
 }
 
+type MalformedRow struct {
+	LineNo int64
+	Raw    string
+	Cause  string
+}
+
 const (
 	ansiRed    = "\033[31m"
 	ansiBold   = "\033[1m"
@@ -132,6 +146,7 @@ const (
 	ansiCyan   = "\033[36m"
 	ansiDim    = "\033[2m"
 	ansiGreen  = "\033[32m"
+	ansiMagenta = "\033[35m"
 )
 
 func enableWindowsVT() {
@@ -142,6 +157,21 @@ func enableWindowsVT() {
 	getMode.Call(uintptr(syscall.Stdout), uintptr(unsafe.Pointer(&mode)))
 	setMode.Call(uintptr(syscall.Stdout), uintptr(mode|0x0004))
 	setMode.Call(uintptr(syscall.Stderr), uintptr(mode|0x0004))
+}
+
+func logMalformed(row MalformedRow) {
+	total := atomic.AddInt64(&malformedCnt, 1)
+	if total <= 10 || total%1000 == 0 {
+		truncated := row.Raw
+		if len(truncated) > 80 {
+			truncated = truncated[:80] + "..."
+		}
+		msg := fmt.Sprintf("%s%s[畸形行] 行号 %d | 原因: %s | 内容: %s%s\n",
+			ansiMagenta, ansiBold, row.LineNo, row.Cause, truncated, ansiReset)
+		outputMu.Lock()
+		fmt.Fprint(os.Stderr, msg)
+		outputMu.Unlock()
+	}
 }
 
 func printAlert(rec SensorRecord, mean, stddev, zscore float64) {
@@ -173,24 +203,70 @@ func printAlert(rec SensorRecord, mean, stddev, zscore float64) {
 }
 
 func parseLine(line string, lineNo int64) (SensorRecord, bool) {
+	if len(line) == 0 {
+		logMalformed(MalformedRow{LineNo: lineNo, Raw: line, Cause: "空行"})
+		return SensorRecord{}, false
+	}
+
 	parts := strings.SplitN(line, ",", 4)
 	if len(parts) < 3 {
+		logMalformed(MalformedRow{LineNo: lineNo, Raw: line, Cause: fmt.Sprintf("字段不足(期望≥3,实际%d)", len(parts))})
 		return SensorRecord{}, false
 	}
-	tension, err := strconv.ParseFloat(strings.TrimSpace(parts[2]), 64)
+
+	timestamp := strings.TrimSpace(parts[0])
+	if timestamp == "" {
+		logMalformed(MalformedRow{LineNo: lineNo, Raw: line, Cause: "时间戳为空"})
+		return SensorRecord{}, false
+	}
+
+	spindleID := strings.TrimSpace(parts[1])
+	if spindleID == "" {
+		logMalformed(MalformedRow{LineNo: lineNo, Raw: line, Cause: "锭子编号为空"})
+		return SensorRecord{}, false
+	}
+
+	tensionStr := strings.TrimSpace(parts[2])
+	if tensionStr == "" {
+		logMalformed(MalformedRow{LineNo: lineNo, Raw: line, Cause: "张力值为空"})
+		return SensorRecord{}, false
+	}
+
+	tension, err := strconv.ParseFloat(tensionStr, 64)
 	if err != nil {
+		logMalformed(MalformedRow{LineNo: lineNo, Raw: line, Cause: fmt.Sprintf("张力解析失败(%q): %v", tensionStr, err)})
 		return SensorRecord{}, false
 	}
+
+	if math.IsNaN(tension) || math.IsInf(tension, 0) {
+		logMalformed(MalformedRow{LineNo: lineNo, Raw: line, Cause: fmt.Sprintf("张力值非有限数: %v", tension)})
+		return SensorRecord{}, false
+	}
+
+	if tension < 0 {
+		logMalformed(MalformedRow{LineNo: lineNo, Raw: line, Cause: fmt.Sprintf("张力值为负数: %.2f", tension)})
+		return SensorRecord{}, false
+	}
+
 	return SensorRecord{
-		Timestamp: strings.TrimSpace(parts[0]),
-		SpindleID: strings.TrimSpace(parts[1]),
+		Timestamp: timestamp,
+		SpindleID: spindleID,
 		Tension:   tension,
 		LineNo:    lineNo,
 	}, true
 }
 
 func streamCSV(path string, ch chan<- SensorRecord) {
-	defer close(ch)
+	defer func() {
+		if r := recover(); r != nil {
+			atomic.AddInt64(&panicCount, 1)
+			outputMu.Lock()
+			fmt.Fprintf(os.Stderr, "%s%s[致命] streamCSV 发生 panic: %v%s\n", ansiRed, ansiBold, r, ansiReset)
+			fmt.Fprintf(os.Stderr, "%s堆栈:\n%s%s\n", ansiRed, debug.Stack(), ansiReset)
+			outputMu.Unlock()
+		}
+		close(ch)
+	}()
 
 	f, err := os.Open(path)
 	if err != nil {
@@ -213,9 +289,6 @@ func streamCSV(path string, ch chan<- SensorRecord) {
 		atomic.StoreInt64(&totalLines, lineNo)
 
 		line := scanner.Text()
-		if line == "" {
-			continue
-		}
 
 		rec, ok := parseLine(line, lineNo)
 		if !ok {
@@ -230,14 +303,45 @@ func streamCSV(path string, ch chan<- SensorRecord) {
 	}
 }
 
-func worker(tracker *SpindleTracker, ch <-chan SensorRecord, wg *sync.WaitGroup) {
-	defer wg.Done()
-	for rec := range ch {
-		window := tracker.GetOrCreate(rec.SpindleID)
-		mean, stddev, zscore, anomaly := window.CheckAndPush(rec.Tension)
-		if anomaly {
-			printAlert(rec, mean, stddev, zscore)
+func worker(id int, tracker *SpindleTracker, ch <-chan SensorRecord, wg *sync.WaitGroup) {
+	defer func() {
+		if r := recover(); r != nil {
+			atomic.AddInt64(&panicCount, 1)
+			outputMu.Lock()
+			fmt.Fprintf(os.Stderr, "%s%s[致命] Worker-%d panic: %v%s\n", ansiRed, ansiBold, id, r, ansiReset)
+			fmt.Fprintf(os.Stderr, "%s堆栈:\n%s%s\n", ansiRed, debug.Stack(), ansiReset)
+			outputMu.Unlock()
 		}
+		wg.Done()
+	}()
+
+	for rec := range ch {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					atomic.AddInt64(&panicCount, 1)
+					outputMu.Lock()
+					fmt.Fprintf(os.Stderr, "%s%s[致命] Worker-%d 处理行 %d 时 panic: %v%s\n",
+						ansiRed, ansiBold, id, rec.LineNo, r, ansiReset)
+					fmt.Fprintf(os.Stderr, "%s堆栈:\n%s%s\n", ansiRed, debug.Stack(), ansiReset)
+					outputMu.Unlock()
+				}
+			}()
+
+			window := tracker.GetOrCreate(rec.SpindleID)
+			mean, stddev, zscore, anomaly, rejected := window.CheckAndPush(rec.Tension)
+			if rejected {
+				logMalformed(MalformedRow{
+					LineNo: rec.LineNo,
+					Raw:    fmt.Sprintf("%s,%s,%.4f", rec.Timestamp, rec.SpindleID, rec.Tension),
+					Cause:  fmt.Sprintf("滑动窗口拒绝(张力=%.4f: NaN/Inf/负值)", rec.Tension),
+				})
+				return
+			}
+			if anomaly {
+				printAlert(rec, mean, stddev, zscore)
+			}
+		}()
 	}
 }
 
@@ -257,7 +361,7 @@ func main() {
 	}
 
 	fmt.Printf("%s%s╔═════════════════════════════════════════════════════════╗%s\n", ansiCyan, ansiBold, ansiReset)
-	fmt.Printf("%s%s║       织布车间 · 经纱张力异常排查终端  v1.0            ║%s\n", ansiCyan, ansiBold, ansiReset)
+	fmt.Printf("%s%s║       织布车间 · 经纱张力异常排查终端  v2.0            ║%s\n", ansiCyan, ansiBold, ansiReset)
 	fmt.Printf("%s%s╚═════════════════════════════════════════════════════════╝%s\n", ansiCyan, ansiBold, ansiReset)
 	fmt.Printf("%s  数据源       : %s%s\n", ansiYellow, argFile, ansiReset)
 	fmt.Printf("%s  滑动窗口     : %d 个数据点%s\n", ansiYellow, argWindow, ansiReset)
@@ -273,7 +377,7 @@ func main() {
 	var wg sync.WaitGroup
 	for i := 0; i < argWorkers; i++ {
 		wg.Add(1)
-		go worker(tracker, ch, &wg)
+		go worker(i, tracker, ch, &wg)
 	}
 
 	start := time.Now()
@@ -288,9 +392,11 @@ func main() {
 			case <-ticker.C:
 				lines := atomic.LoadInt64(&totalLines)
 				anomalies := atomic.LoadInt64(&anomalyCount)
+				malformed := atomic.LoadInt64(&malformedCnt)
+				panics := atomic.LoadInt64(&panicCount)
 				elapsed := time.Since(start).Round(time.Millisecond)
-				msg := fmt.Sprintf("%s[进度] 已处理 %d 行 | 预警 %d 条 | 耗时 %v%s\n",
-					ansiDim, lines, anomalies, elapsed, ansiReset)
+				msg := fmt.Sprintf("%s[进度] 已处理 %d 行 | 预警 %d 条 | 畸形 %d 行 | panic %d 次 | 耗时 %v%s\n",
+					ansiDim, lines, anomalies, malformed, panics, elapsed, ansiReset)
 				outputMu.Lock()
 				fmt.Print(msg)
 				outputMu.Unlock()
@@ -306,6 +412,8 @@ func main() {
 	elapsed := time.Since(start).Round(time.Millisecond)
 	lines := atomic.LoadInt64(&totalLines)
 	anomalies := atomic.LoadInt64(&anomalyCount)
+	malformed := atomic.LoadInt64(&malformedCnt)
+	panics := atomic.LoadInt64(&panicCount)
 	spindleCount := tracker.Len()
 
 	fmt.Println()
@@ -315,6 +423,12 @@ func main() {
 	fmt.Printf("  总处理行数   : %s%d%s\n", ansiBold, lines, ansiReset)
 	fmt.Printf("  活跃锭子数   : %s%d%s\n", ansiBold, spindleCount, ansiReset)
 	fmt.Printf("  异常预警数   : %s%s%d%s%s\n", ansiRed, ansiBold, anomalies, ansiReset, ansiReset)
+	if malformed > 0 {
+		fmt.Printf("  畸形行数     : %s%s%d%s%s\n", ansiMagenta, ansiBold, malformed, ansiReset, ansiReset)
+	}
+	if panics > 0 {
+		fmt.Printf("  Panic 捕获   : %s%s%d%s%s (已恢复，未死锁)\n", ansiRed, ansiBold, panics, ansiReset, ansiReset)
+	}
 	fmt.Printf("  总耗时       : %v\n", elapsed)
 	if lines > 0 && elapsed.Seconds() > 0 {
 		rate := float64(lines) / elapsed.Seconds()
